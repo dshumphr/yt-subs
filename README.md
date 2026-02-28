@@ -12,9 +12,12 @@ Simple CLI tool to track a fixed set of YouTube channels and list each channel's
 ```bash
 python3 yt_channel_watch.py add @lourlo
 python3 yt_channel_watch.py add @yogscast --name "the yogscast"
+python3 yt_channel_watch.py tag-add @lourlo league toplane
+python3 yt_channel_watch.py tag-remove @lourlo toplane
+python3 yt_channel_watch.py tags
 python3 yt_channel_watch.py channels
 python3 yt_channel_watch.py list
-python3 yt_channel_watch.py list --hours 48
+python3 yt_channel_watch.py list --hours 48 --tag-regex "league|variety"
 python3 yt_channel_watch.py remove @lourlo
 ```
 

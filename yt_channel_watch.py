@@ -8,7 +8,7 @@ import sys
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple
@@ -24,6 +24,7 @@ class Channel:
     channel_id: str
     name: str
     source: str
+    tags: List[str]
 
 
 @dataclass
@@ -46,11 +47,16 @@ def load_channels(config_path: Path) -> List[Channel]:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     channels: List[Channel] = []
     for entry in data:
+        tags = entry.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        cleaned_tags = sorted({str(tag).strip() for tag in tags if str(tag).strip()})
         channels.append(
             Channel(
                 channel_id=entry["channel_id"],
                 name=entry["name"],
                 source=entry.get("source", entry["channel_id"]),
+                tags=cleaned_tags,
             )
         )
     return channels
@@ -66,6 +72,14 @@ def normalize_channel_input(value: str) -> str:
     if text.endswith("/"):
         text = text[:-1]
     return text
+
+
+def normalize_tag(tag: str) -> str:
+    return tag.strip()
+
+
+def format_tags(tags: List[str]) -> str:
+    return ", ".join(tags) if tags else "-"
 
 
 def extract_channel_id_from_url(url: str) -> str | None:
@@ -200,6 +214,19 @@ def fetch_most_recent_full_length_video(channel: Channel, cutoff: datetime) -> V
     return None
 
 
+def find_channel(channels: List[Channel], target: str) -> Channel | None:
+    normalized = normalize_channel_input(target)
+    lowered = normalized.lower()
+    for channel in channels:
+        if channel.channel_id == normalized:
+            return channel
+        if normalize_channel_input(channel.source) == normalized:
+            return channel
+        if normalize_channel_input(channel.name).lower() == lowered:
+            return channel
+    return None
+
+
 def command_add(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser().resolve()
     channels = load_channels(config_path)
@@ -211,7 +238,9 @@ def command_add(args: argparse.Namespace) -> int:
             return 0
 
     display_name = args.name.strip() if args.name else channel_name
-    channels.append(Channel(channel_id=channel_id, name=display_name, source=source))
+    channels.append(
+        Channel(channel_id=channel_id, name=display_name, source=source, tags=[])
+    )
     save_channels(config_path, channels)
     print(f"Added: {display_name} ({channel_id})")
     return 0
@@ -220,23 +249,84 @@ def command_add(args: argparse.Namespace) -> int:
 def command_remove(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser().resolve()
     channels = load_channels(config_path)
-    target = normalize_channel_input(args.channel)
+    channel = find_channel(channels, args.channel)
 
-    before = len(channels)
-    channels = [
-        channel
-        for channel in channels
-        if channel.channel_id != target
-        and normalize_channel_input(channel.source) != target
-        and normalize_channel_input(channel.name) != target
-    ]
-
-    if len(channels) == before:
+    if channel is None:
         print("No matching channel found.")
         return 1
 
+    channels = [item for item in channels if item.channel_id != channel.channel_id]
     save_channels(config_path, channels)
     print("Removed.")
+    return 0
+
+
+def command_tag_add(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser().resolve()
+    channels = load_channels(config_path)
+    channel = find_channel(channels, args.channel)
+
+    if channel is None:
+        print("No matching channel found.")
+        return 1
+
+    added: List[str] = []
+    for raw_tag in args.tags:
+        tag = normalize_tag(raw_tag)
+        if not tag:
+            continue
+        if tag in channel.tags:
+            continue
+        channel.tags.append(tag)
+        added.append(tag)
+
+    channel.tags.sort()
+    save_channels(config_path, channels)
+
+    if added:
+        print(f"Added tag(s) to {channel.name}: {', '.join(added)}")
+    else:
+        print("No new tags added.")
+    return 0
+
+
+def command_tag_remove(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser().resolve()
+    channels = load_channels(config_path)
+    channel = find_channel(channels, args.channel)
+
+    if channel is None:
+        print("No matching channel found.")
+        return 1
+
+    targets = {normalize_tag(tag) for tag in args.tags if normalize_tag(tag)}
+    if not targets:
+        print("No tags provided.")
+        return 1
+
+    before = set(channel.tags)
+    channel.tags = sorted(tag for tag in channel.tags if tag not in targets)
+    removed = sorted(before - set(channel.tags))
+    save_channels(config_path, channels)
+
+    if removed:
+        print(f"Removed tag(s) from {channel.name}: {', '.join(removed)}")
+    else:
+        print("No matching tags removed.")
+    return 0
+
+
+def command_tags(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser().resolve()
+    channels = load_channels(config_path)
+
+    all_tags = sorted({tag for channel in channels for tag in channel.tags})
+    if not all_tags:
+        print("No tags configured.")
+        return 0
+
+    for tag in all_tags:
+        print(tag)
     return 0
 
 
@@ -248,7 +338,10 @@ def command_channels(args: argparse.Namespace) -> int:
         return 0
 
     for channel in channels:
-        print(f"- {channel.name} ({channel.channel_id}) [{channel.source}]")
+        print(
+            f"- {channel.name} ({channel.channel_id}) [{channel.source}] "
+            f"tags: {format_tags(channel.tags)}"
+        )
     return 0
 
 
@@ -258,6 +351,21 @@ def command_list(args: argparse.Namespace) -> int:
     if not channels:
         print("No channels configured. Add one with `add`.")
         return 1
+
+    if args.tag_regex:
+        try:
+            tag_pattern = re.compile(args.tag_regex)
+        except re.error as exc:
+            print(f"Invalid --tag-regex: {exc}", file=sys.stderr)
+            return 2
+        channels = [
+            channel
+            for channel in channels
+            if any(tag_pattern.search(tag) for tag in channel.tags)
+        ]
+        if not channels:
+            print(f"No channels matched tag regex: {args.tag_regex}")
+            return 1
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=args.hours)
@@ -309,14 +417,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.set_defaults(func=command_add)
 
     remove_parser = subparsers.add_parser("remove", help="Remove a channel")
-    remove_parser.add_argument("channel", help="Channel id, source URL/handle, or exact display name")
+    remove_parser.add_argument("channel", help="Channel id, source URL/handle, or channel name")
     remove_parser.set_defaults(func=command_remove)
 
-    channels_parser = subparsers.add_parser("channels", help="Show configured channels")
+    channels_parser = subparsers.add_parser("channels", help="Show configured channels and tags")
     channels_parser.set_defaults(func=command_channels)
+
+    tag_add_parser = subparsers.add_parser("tag-add", help="Add tag(s) to a channel")
+    tag_add_parser.add_argument("channel", help="Channel id, source URL/handle, or channel name")
+    tag_add_parser.add_argument("tags", nargs="+", help="Tag values to add")
+    tag_add_parser.set_defaults(func=command_tag_add)
+
+    tag_remove_parser = subparsers.add_parser("tag-remove", help="Remove tag(s) from a channel")
+    tag_remove_parser.add_argument("channel", help="Channel id, source URL/handle, or channel name")
+    tag_remove_parser.add_argument("tags", nargs="+", help="Tag values to remove")
+    tag_remove_parser.set_defaults(func=command_tag_remove)
+
+    tags_parser = subparsers.add_parser("tags", help="List all tags currently in use")
+    tags_parser.set_defaults(func=command_tags)
 
     list_parser = subparsers.add_parser("list", help="List recent videos")
     list_parser.add_argument("--hours", type=float, default=24.0, help="How many hours back to check")
+    list_parser.add_argument(
+        "--tag-regex",
+        help="Only include channels with at least one tag matching this regex",
+    )
     list_parser.set_defaults(func=command_list)
 
     return parser
